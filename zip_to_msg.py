@@ -305,16 +305,17 @@ def build_zip_msg(zip_path):
     b.add_stream('dispto', dispto)
 
     # ── 첨부 스트림 데이터 ──
-    ext    = encode16(zip_ext)
-    lname  = encode16(zip_name)
-    mime   = encode16(mime_type)
-    locale = encode16('EnUs')
+    ext       = encode16(zip_ext)
+    lname     = encode16(zip_name)       # 긴 파일명 (3707, 3001)
+    shortname = encode16(zip_ext)        # 단축 파일명은 확장자만 (3703) — 실제 Outlook 동작과 동일
+    mime      = encode16(mime_type)
+    locale    = encode16('EnUs')
 
     att_prop = build_att_props([
         prop_fixed(0x0003, 0x0E21, struct.pack('<I', 0)),
         prop_fixed(0x0003, 0x3705, struct.pack('<I', 1)),
         prop_var(0x001F, 0x3001, len(lname)),
-        prop_var(0x001F, 0x3703, len(lname)),
+        prop_var(0x001F, 0x3703, len(shortname)),
         prop_var(0x001F, 0x3704, len(ext)),
         prop_var(0x001F, 0x3707, len(lname)),
         prop_var(0x001F, 0x370E, len(mime)),
@@ -325,12 +326,10 @@ def build_zip_msg(zip_path):
     b.add_stream('att_prop', att_prop)
     b.add_stream('ext', ext)
     b.add_stream('lname', lname)
+    b.add_stream('shortname', shortname)
     b.add_stream('mime', mime)
     b.add_stream('locale', locale)
     b.add_stream('zipdata', zip_raw)   # 큰 데이터는 자동으로 일반 섹터 사용
-    b.add_stream('ng', b'\x00' * 16)
-    b.add_stream('ne', b'\x00' * 8)
-    b.add_stream('ns', b'\x00' * 4)
 
     def build_dirs(info, root_start, root_size):
         dirs = []
@@ -344,19 +343,15 @@ def build_zip_msg(zip_path):
         dirs.append(de('__substg1.0_0070001F', 2, *info('ctopic'), right=8))
         dirs.append(de('__substg1.0_1000001F', 2, *info('body'), right=9))
         dirs.append(de('__substg1.0_0E04001F', 2, *info('dispto'), right=10))
-        dirs.append(de('__attach_version1.0_#00000000', 1, NOSTREAM, 0, child=11, right=19))
+        dirs.append(de('__attach_version1.0_#00000000', 1, NOSTREAM, 0, child=11))
         dirs.append(de('__properties_version1.0', 2, *info('att_prop'), right=12))
         dirs.append(de('__substg1.0_3704001F', 2, *info('ext'), right=13))
-        dirs.append(de('__substg1.0_3703001F', 2, *info('lname'), right=14))
+        dirs.append(de('__substg1.0_3703001F', 2, *info('shortname'), right=14))
         dirs.append(de('__substg1.0_3707001F', 2, *info('lname'), right=15))
         dirs.append(de('__substg1.0_3001001F', 2, *info('lname'), right=16))
         dirs.append(de('__substg1.0_370E001F', 2, *info('mime'), right=17))
         dirs.append(de('__substg1.0_3A0C001F', 2, *info('locale'), right=18))
         dirs.append(de('__substg1.0_37010102', 2, *info('zipdata')))
-        dirs.append(de('__nameid_version1.0', 1, NOSTREAM, 0, child=20))
-        dirs.append(de('__substg1.0_00020102', 2, *info('ng'), right=21))
-        dirs.append(de('__substg1.0_00030102', 2, *info('ne'), right=22))
-        dirs.append(de('__substg1.0_00040102', 2, *info('ns')))
         return dirs
 
     return b.finalize(build_dirs)
