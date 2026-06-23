@@ -69,6 +69,32 @@ def empty_de():
            struct.pack('<II', ENDOFCHAIN, 0) + b'\x00' * 4
 
 
+def ole_sort_key(name):
+    """OLE2 디렉토리 정렬 규칙: 이름 길이 우선, 그다음 대소문자 무시 비교"""
+    return (len(name), name.upper())
+
+
+def build_storage_chain(children, sid_offset):
+    """
+    같은 부모를 가진 자식 엔트리들을 OLE2 정렬 규칙에 따라 정렬한 뒤
+    단순 사슬(각 노드의 right만 다음 노드를 가리킴, 퇴화 BST) 형태의
+    디렉토리 엔트리 리스트를 만든다. 모든 색은 black(1)으로 통일.
+
+    children: [(name, etype, start, size, child_sid_or_None)]
+    sid_offset: 이 그룹의 첫 엔트리가 배치될 SID
+    반환: (정렬된 dir_entry 바이트 리스트, 첫 엔트리의 SID)
+    """
+    ordered = sorted(children, key=lambda c: ole_sort_key(c[0]))
+    entries = []
+    n = len(ordered)
+    for i, (name, etype, start, size, child_sid) in enumerate(ordered):
+        right = sid_offset + i + 1 if i + 1 < n else NOSTREAM
+        child = child_sid if child_sid is not None else NOSTREAM
+        entries.append(de(name, etype, start, size, child=child, right=right, color=1))
+    first_sid = sid_offset if n else NOSTREAM
+    return entries, first_sid
+
+
 def build_root_props(entries, next_recipient_id=0, next_attachment_id=1,
                       recipient_count=0, attachment_count=1):
     """
@@ -332,26 +358,38 @@ def build_zip_msg(zip_path):
     b.add_stream('zipdata', zip_raw)   # 큰 데이터는 자동으로 일반 섹터 사용
 
     def build_dirs(info, root_start, root_size):
-        dirs = []
-        dirs.append(de('Root Entry', 5, root_start, root_size, child=1, color=0))
-        dirs.append(de('__properties_version1.0', 2, *info('root_prop'), right=2))
-        dirs.append(de('__substg1.0_001A001F', 2, *info('mc'), right=3))
-        dirs.append(de('__substg1.0_0037001F', 2, *info('subj'), right=4))
-        dirs.append(de('__substg1.0_0C1A001F', 2, *info('sname'), right=5))
-        dirs.append(de('__substg1.0_0C1F001F', 2, *info('semail'), right=6))
-        dirs.append(de('__substg1.0_0C1E001F', 2, *info('stype'), right=7))
-        dirs.append(de('__substg1.0_0070001F', 2, *info('ctopic'), right=8))
-        dirs.append(de('__substg1.0_1000001F', 2, *info('body'), right=9))
-        dirs.append(de('__substg1.0_0E04001F', 2, *info('dispto'), right=10))
-        dirs.append(de('__attach_version1.0_#00000000', 1, NOSTREAM, 0, child=11))
-        dirs.append(de('__properties_version1.0', 2, *info('att_prop'), right=12))
-        dirs.append(de('__substg1.0_3704001F', 2, *info('ext'), right=13))
-        dirs.append(de('__substg1.0_3703001F', 2, *info('shortname'), right=14))
-        dirs.append(de('__substg1.0_3707001F', 2, *info('lname'), right=15))
-        dirs.append(de('__substg1.0_3001001F', 2, *info('lname'), right=16))
-        dirs.append(de('__substg1.0_370E001F', 2, *info('mime'), right=17))
-        dirs.append(de('__substg1.0_3A0C001F', 2, *info('locale'), right=18))
-        dirs.append(de('__substg1.0_37010102', 2, *info('zipdata')))
+        # ── 첨부 스토리지의 자식들 (정렬 후 사슬 구성) ──
+        att_children = [
+            ('__properties_version1.0', 2, *info('att_prop'), None),
+            ('__substg1.0_3704001F',     2, *info('ext'),       None),
+            ('__substg1.0_3703001F',     2, *info('shortname'), None),
+            ('__substg1.0_3707001F',     2, *info('lname'),     None),
+            ('__substg1.0_3001001F',     2, *info('lname'),     None),
+            ('__substg1.0_370E001F',     2, *info('mime'),      None),
+            ('__substg1.0_3A0C001F',     2, *info('locale'),    None),
+            ('__substg1.0_37010102',     2, *info('zipdata'),   None),
+        ]
+        # SID 배치: 0=Root, 1..9=루트 자식(9개), 10=첨부 스토리지, 11..18=첨부 자식(8개)
+        att_entries, att_first = build_storage_chain(att_children, sid_offset=11)
+
+        # ── 루트의 자식들 (첨부 스토리지 포함) ──
+        root_children = [
+            ('__properties_version1.0',      2, *info('root_prop'), None),
+            ('__substg1.0_001A001F',          2, *info('mc'),       None),
+            ('__substg1.0_0037001F',          2, *info('subj'),     None),
+            ('__substg1.0_0C1A001F',          2, *info('sname'),    None),
+            ('__substg1.0_0C1F001F',          2, *info('semail'),   None),
+            ('__substg1.0_0C1E001F',          2, *info('stype'),    None),
+            ('__substg1.0_0070001F',          2, *info('ctopic'),   None),
+            ('__substg1.0_1000001F',          2, *info('body'),     None),
+            ('__substg1.0_0E04001F',          2, *info('dispto'),   None),
+            ('__attach_version1.0_#00000000', 1, NOSTREAM, 0,        att_first),
+        ]
+        root_entries, root_first = build_storage_chain(root_children, sid_offset=1)
+
+        dirs = [de('Root Entry', 5, root_start, root_size, child=root_first, color=0)]
+        dirs.extend(root_entries)
+        dirs.extend(att_entries)
         return dirs
 
     return b.finalize(build_dirs)
