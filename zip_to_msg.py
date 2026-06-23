@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-ZIP to MSG Converter
-같은 폴더의 .zip 파일을 전부 첨부파일이 포함된 .msg 파일로 변환합니다.
-실제 Outlook MSG 구조(Mini FAT 포함)를 따릅니다.
+ZIP to MSG Converter (템플릿 기반)
+실제 Outlook이 생성한 template.msg의 모든 메타데이터/구조를 그대로 사용하고,
+첨부 storage의 데이터(파일명/확장자/MIME/바이너리)만 새 zip으로 교체하여
+완전히 Outlook 호환되는 .msg 파일을 생성합니다.
+
+같은 폴더의 .zip 파일과 template.msg를 읽어 .msg를 생성합니다.
 """
 
-import struct, os, sys, glob
+import struct
+import os
+import sys
+import glob
 from datetime import datetime, timezone
 
-ENDOFCHAIN   = 0xFFFFFFFE
-FREESECT     = 0xFFFFFFFF
-NOSTREAM     = 0xFFFFFFFF
-FATSECT      = 0xFFFFFFFD
-DIFSECT      = 0xFFFFFFFC
-MINI_CUTOFF  = 4096   # 이 크기 미만 스트림은 미니 스트림으로 저장
-MINI_SECTOR  = 64     # 미니 섹터 크기
+ENDOFCHAIN = 0xFFFFFFFE
+FREESECT   = 0xFFFFFFFF
+NOSTREAM   = 0xFFFFFFFF
+FATSECT    = 0xFFFFFFFD
+DIFSECT    = 0xFFFFFFFC
 
 
 def get_exe_dir():
@@ -27,18 +31,177 @@ def encode16(s):
     return (s + '\x00').encode('utf-16-le')
 
 
-def pad_to(data, n):
-    r = len(data) % n
-    return data + b'\x00' * (n - r) if r else data
+def pad512(data):
+    r = len(data) % 512
+    return data + b'\x00' * (512 - r) if r else data
 
 
-def pad512(d):
-    return pad_to(d, 512)
+# ────────────────────────────────────────────────────────────
+# OLE2 읽기 (FAT/미니FAT/디렉토리 전부 파싱)
+# ────────────────────────────────────────────────────────────
+
+class OleReader:
+    def __init__(self, path):
+        with open(path, 'rb') as f:
+            self.raw = f.read()
+        self._parse_header()
+        self._parse_fat()
+        self._parse_minifat()
+        self._parse_dir()
+
+    def _parse_header(self):
+        raw = self.raw
+        self.dir_start    = struct.unpack_from('<I', raw, 48)[0]
+        self.mini_cutoff  = struct.unpack_from('<I', raw, 56)[0]
+        self.minifat_start = struct.unpack_from('<I', raw, 60)[0]
+        self.minifat_count = struct.unpack_from('<I', raw, 64)[0]
+        self.difat_start  = struct.unpack_from('<I', raw, 68)[0]
+        self.difat_count  = struct.unpack_from('<I', raw, 72)[0]
+
+    def _sector(self, idx):
+        off = 512 + idx * 512
+        return self.raw[off:off + 512]
+
+    def _parse_fat(self):
+        fat_sectors = []
+        for i in range(109):
+            v = struct.unpack_from('<I', self.raw, 76 + i * 4)[0]
+            if v == FREESECT:
+                break
+            fat_sectors.append(v)
+        cur = self.difat_start
+        for _ in range(self.difat_count):
+            sec = self._sector(cur)
+            entries = struct.unpack_from('<128I', sec, 0)
+            fat_sectors.extend([e for e in entries[:127] if e != FREESECT])
+            cur = entries[127]
+            if cur in (FREESECT, ENDOFCHAIN):
+                break
+        fat = []
+        for s in fat_sectors:
+            fat.extend(struct.unpack_from('<128I', self._sector(s), 0))
+        self.fat = fat
+
+    def _parse_minifat(self):
+        mini_fat = []
+        if self.minifat_count and self.minifat_start not in (FREESECT, ENDOFCHAIN):
+            cur = self.minifat_start
+            seen = 0
+            while cur not in (FREESECT, ENDOFCHAIN) and seen < self.minifat_count:
+                mini_fat.extend(struct.unpack_from('<128I', self._sector(cur), 0))
+                cur = self.fat[cur]
+                seen += 1
+        self.minifat = mini_fat
+
+    def _chain(self, start):
+        if start in (FREESECT, ENDOFCHAIN, NOSTREAM):
+            return []
+        chain = [start]
+        cur = self.fat[start]
+        while cur not in (FREESECT, ENDOFCHAIN):
+            chain.append(cur)
+            cur = self.fat[cur]
+        return chain
+
+    def _mini_chain(self, start):
+        if start in (FREESECT, ENDOFCHAIN, NOSTREAM):
+            return []
+        chain = [start]
+        cur = self.minifat[start]
+        while cur not in (FREESECT, ENDOFCHAIN):
+            chain.append(cur)
+            cur = self.minifat[cur]
+        return chain
+
+    def _parse_dir(self):
+        chain = self._chain(self.dir_start)
+        entries = []
+        for sec in chain:
+            data = self._sector(sec)
+            for i in range(4):
+                entries.append(data[i * 128:(i + 1) * 128])
+        self.dir_raw = entries  # 128바이트 원본 그대로 보관 (SID = index)
+
+        # Root Entry의 미니스트림 시작 섹터 확보
+        root = entries[0]
+        self.ministream_start = struct.unpack_from('<I', root, 116)[0]
+
+    def entry_name(self, sid):
+        e = self.dir_raw[sid]
+        return e[:64].decode('utf-16-le', errors='replace').rstrip('\x00').strip()
+
+    def entry_fields(self, sid):
+        e = self.dir_raw[sid]
+        return {
+            'etype': e[66],
+            'color': e[67],
+            'left': struct.unpack_from('<I', e, 68)[0],
+            'right': struct.unpack_from('<I', e, 72)[0],
+            'child': struct.unpack_from('<I', e, 76)[0],
+            'start': struct.unpack_from('<I', e, 116)[0],
+            'size': struct.unpack_from('<I', e, 120)[0],
+        }
+
+    def read_stream(self, sid):
+        f = self.entry_fields(sid)
+        size = f['size']
+        if size == 0:
+            return b''
+        if size < self.mini_cutoff:
+            mchain = self._mini_chain(f['start'])
+            mini_sector_size = 64
+            ministream_chain = self._chain(self.ministream_start)
+            data = b''
+            for sec in ministream_chain:
+                data += self._sector(sec)
+            out = b''
+            for m in mchain:
+                off = m * mini_sector_size
+                out += data[off:off + mini_sector_size]
+            return out[:size]
+        else:
+            chain = self._chain(f['start'])
+            data = b''
+            for sec in chain:
+                data += self._sector(sec)
+            return data[:size]
+
+    def find_child_by_name(self, parent_sid, name):
+        """parent_sid의 자식 트리를 순회하며 이름이 일치하는 SID 반환"""
+        root_field = self.entry_fields(parent_sid)
+        return self._bst_find(root_field['child'], name)
+
+    def _bst_find(self, sid, name):
+        if sid == NOSTREAM:
+            return None
+        ename = self.entry_name(sid)
+        if ename == name:
+            return sid
+        f = self.entry_fields(sid)
+        res = self._bst_find(f['left'], name)
+        if res is not None:
+            return res
+        return self._bst_find(f['right'], name)
+
+    def all_children(self, parent_sid):
+        """parent_sid 바로 아래 자식 SID 전부 (BST 순회, 정렬됨)"""
+        f = self.entry_fields(parent_sid)
+        result = []
+        self._bst_walk(f['child'], result)
+        return result
+
+    def _bst_walk(self, sid, result):
+        if sid == NOSTREAM:
+            return
+        f = self.entry_fields(sid)
+        self._bst_walk(f['left'], result)
+        result.append(sid)
+        self._bst_walk(f['right'], result)
 
 
-def pad64(d):
-    return pad_to(d, MINI_SECTOR)
-
+# ────────────────────────────────────────────────────────────
+# OLE2 쓰기 (템플릿의 모든 구조를 그대로 복제하며 재조립)
+# ────────────────────────────────────────────────────────────
 
 def filetime_now():
     dt = datetime.now(timezone.utc)
@@ -46,385 +209,272 @@ def filetime_now():
     return struct.pack('<Q', int((dt - epoch).total_seconds() * 10_000_000))
 
 
-def de(name, etype, start, size,
-       child=NOSTREAM, left=NOSTREAM, right=NOSTREAM, color=1):
-    """OLE2 디렉토리 엔트리 128바이트"""
-    ne   = name.encode('utf-16-le')[:62]
-    nlen = len(ne) + 2 if ne else 0
-    ne   = ne.ljust(64, b'\x00')
-    b    = struct.pack('<H', nlen) + struct.pack('<B', etype) + struct.pack('<B', color)
-    b   += struct.pack('<III', left, right, child)
-    b   += b'\x00' * 16 + struct.pack('<IQQ', 0, 0, 0)
-    # storage(폴더, etype=1)는 start sector가 의미 없으므로 0으로 고정.
-    # stream(etype=2)에서 start=NOSTREAM이면(빈 스트림) ENDOFCHAIN으로 표기.
-    if etype == 1:
-        real_start = 0
-    elif etype == 5:
-        # Root Entry: 미니 스트림 컨테이너 시작 섹터(없으면 ENDOFCHAIN)
-        real_start = start if start != NOSTREAM else ENDOFCHAIN
-    else:
-        real_start = start if start != NOSTREAM else ENDOFCHAIN
-    b   += struct.pack('<II', real_start, size)
-    b   += b'\x00' * 4
-    assert len(ne) + len(b) == 128
-    return ne + b
-
-
-def empty_de():
-    """패딩용 빈 디렉토리 엔트리 (STGTY_INVALID=0, sibling/child=NOSTREAM, start/size=0)"""
-    name = b'\x00' * 64
-    body = struct.pack('<H', 0)        # name length = 0
-    body += struct.pack('<B', 0)       # object type = 0 (unknown/unused)
-    body += struct.pack('<B', 0)       # color flag = red(0)
-    body += struct.pack('<III', NOSTREAM, NOSTREAM, NOSTREAM)  # left, right, child
-    body += b'\x00' * 16               # CLSID
-    body += struct.pack('<I', 0)       # state bits
-    body += struct.pack('<QQ', 0, 0)   # created, modified
-    body += struct.pack('<II', 0, 0)   # start sector, size
-    body += b'\x00' * 4                # reserved (size high, for v4)
-    assert len(name) + len(body) == 128
-    return name + body
-
-
-def ole_sort_key(name):
-    """OLE2 디렉토리 정렬 규칙: 이름 길이 우선, 그다음 대소문자 무시 비교"""
-    return (len(name), name.upper())
-
-
-def build_storage_chain(children, sid_offset):
+def build_msg_from_template(template_path, zip_path):
     """
-    같은 부모를 가진 자식 엔트리들을 OLE2 정렬 규칙에 따라 정렬한 뒤
-    단순 사슬(각 노드의 right만 다음 노드를 가리킴, 퇴화 BST) 형태의
-    디렉토리 엔트리 리스트를 만든다. 모든 색은 black(1)으로 통일.
+    template_path: 실제 Outlook이 만든 .msg (구조/메타데이터 원본)
+    zip_path: 새로 첨부할 zip 파일
 
-    children: [(name, etype, start, size, child_sid_or_None)]
-    sid_offset: 이 그룹의 첫 엔트리가 배치될 SID
-    반환: (정렬된 dir_entry 바이트 리스트, 첫 엔트리의 SID)
+    동작:
+      1. 템플릿의 모든 스트림(루트+첨부 storage)을 읽어들임
+      2. 첨부 storage의 파일명/확장자/MIME/데이터를 새 zip 정보로 교체
+      3. 동일한 구조(디렉토리 색상/순서/메타데이터)로 새 OLE2 파일을 재조립
     """
-    ordered = sorted(children, key=lambda c: ole_sort_key(c[0]))
-    entries = []
-    n = len(ordered)
-    for i, (name, etype, start, size, child_sid) in enumerate(ordered):
-        right = sid_offset + i + 1 if i + 1 < n else NOSTREAM
-        child = child_sid if child_sid is not None else NOSTREAM
-        entries.append(de(name, etype, start, size, child=child, right=right, color=1))
-    first_sid = sid_offset if n else NOSTREAM
-    return entries, first_sid
+    reader = OleReader(template_path)
 
-
-def build_root_props(entries, next_recipient_id=0, next_attachment_id=1,
-                      recipient_count=0, attachment_count=1):
-    """
-    루트 properties 헤더 32바이트 (MS-OXMSG):
-      reserved(8) + nextRecipientId(4) + nextAttachmentId(4)
-      + recipientCount(4) + attachmentCount(4) + reserved(8)
-    엔트리는 16바이트: ptype(2)+tag(2)+flag(4)+value(8)
-    """
-    hdr = b'\x00' * 8
-    hdr += struct.pack('<I', next_recipient_id)
-    hdr += struct.pack('<I', next_attachment_id)
-    hdr += struct.pack('<I', recipient_count)
-    hdr += struct.pack('<I', attachment_count)
-    hdr += b'\x00' * 8
-    body = b''.join(entries)
-    return hdr + body
-
-
-def build_att_props(entries):
-    """첨부 properties: 헤더 8바이트(reserved) + 16바이트 엔트리 반복"""
-    body = b''.join(entries)
-    return b'\x00' * 8 + body
-
-
-def prop_fixed(ptype, tag, value8):
-    """고정 크기 프로퍼티 16바이트: ptype+tag+flag(4)+value(8, 부족하면 0패딩)
-    실제 Outlook 파일 분석 결과 flag는 고정/가변 무관하게 항상 0x00000006."""
-    value8 = value8[:8].ljust(8, b'\x00')
-    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 6) + value8
-
-
-def prop_var(ptype, tag, size):
-    """가변 크기 프로퍼티 16바이트: ptype+tag+flag(6)+size(4)+reserved(3)"""
-    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 6) + struct.pack('<I', size) + struct.pack('<I', 3)
-
-
-class MsgBuilder:
-    """
-    OLE2 Compound File 빌더.
-    - 4096바이트 이상 스트림 → 일반 섹터(512바이트) + 일반 FAT
-    - 4096바이트 미만 스트림 → 미니 스트림(64바이트 섹터) + 미니 FAT
-    """
-
-    def __init__(self):
-        self.big_sectors  = []   # 512바이트 일반 섹터들
-        self.big_fat      = []
-        self.mini_sectors = []   # 64바이트 미니 섹터들 (나중에 512배수로 묶어 일반 섹터에 저장)
-        self.mini_fat      = []
-        self.streams = []        # (key, raw_size, is_mini, start)
-
-    def add_stream(self, key, data):
-        """실제 데이터(패딩 전)를 받아 적절히 배치, 실제 크기를 size로 사용"""
-        raw_size = len(data)
-        if raw_size == 0:
-            self.streams.append((key, 0, False, NOSTREAM))
-            return
-        if raw_size < MINI_CUTOFF:
-            # 미니 스트림에 64바이트 단위로 저장
-            padded = pad64(data)
-            nsec = len(padded) // MINI_SECTOR
-            start = len(self.mini_sectors)
-            for i in range(nsec):
-                self.mini_sectors.append(padded[i*MINI_SECTOR:(i+1)*MINI_SECTOR])
-                self.mini_fat.append(start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
-            self.streams.append((key, raw_size, True, start))
-        else:
-            # 일반 섹터에 512바이트 단위로 저장
-            padded = pad512(data)
-            nsec = len(padded) // 512
-            start = len(self.big_sectors)
-            for i in range(nsec):
-                self.big_sectors.append(padded[i*512:(i+1)*512])
-                self.big_fat.append(start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
-            self.streams.append((key, raw_size, False, start))
-
-    def info(self, key):
-        """(start, size, is_mini) 반환"""
-        for k, sz, is_mini, start in self.streams:
-            if k == key:
-                return start, sz, is_mini
-        raise KeyError(key)
-
-    def finalize(self, dir_entries_builder):
-        """
-        dir_entries_builder(info_func) -> list[dir_entry_bytes]
-        디렉토리 엔트리들을 생성하고 전체 OLE2 파일 바이트 반환
-        """
-        # 1) 미니스트림을 512바이트 단위로 패킹하여 일반 섹터에 저장
-        mini_stream_blob = pad512(b''.join(self.mini_sectors))
-        root_start = NOSTREAM
-        root_size  = 0
-        if mini_stream_blob:
-            nsec = len(mini_stream_blob) // 512
-            root_start = len(self.big_sectors)
-            for i in range(nsec):
-                self.big_sectors.append(mini_stream_blob[i*512:(i+1)*512])
-                self.big_fat.append(root_start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
-            root_size = len(b''.join(self.mini_sectors))  # 실제 미니스트림 크기
-
-        # 2) 미니 FAT 섹터 (128개씩 일반 섹터에 저장)
-        minifat_start = ENDOFCHAIN
-        n_minifat_sectors = 0
-        if self.mini_fat:
-            rem = len(self.mini_fat) % 128
-            mf  = self.mini_fat + ([FREESECT] * (128 - rem) if rem else [])
-            n_minifat_sectors = len(mf) // 128
-            minifat_start = len(self.big_sectors)
-            for i in range(n_minifat_sectors):
-                chunk = mf[i*128:(i+1)*128]
-                self.big_sectors.append(struct.pack('<128I', *chunk))
-                self.big_fat.append(minifat_start + i + 1 if i < n_minifat_sectors - 1 else ENDOFCHAIN)
-
-        # 3) 디렉토리 엔트리 생성 (콜백으로 위임)
-        def info_func(key):
-            start, size, is_mini = self.info(key)
-            return start, size
-        dir_entries = dir_entries_builder(info_func, root_start, root_size)
-        while len(dir_entries) % 4:
-            dir_entries.append(empty_de())
-        dir_data = pad512(b''.join(dir_entries))
-        dir_nsec = len(dir_data) // 512
-        dir_start = len(self.big_sectors)
-        for i in range(dir_nsec):
-            self.big_sectors.append(dir_data[i*512:(i+1)*512])
-            self.big_fat.append(dir_start + i + 1 if i < dir_nsec - 1 else ENDOFCHAIN)
-
-        # 4) FAT + DIFAT 섹터 계산
-        n_data = len(self.big_sectors)
-        n_fat = max(1, (n_data + 127) // 128)
-        n_difat = 0
-        for _ in range(5):
-            n_difat = max(0, (n_fat - 109 + 126) // 127) if n_fat > 109 else 0
-            n_fat = max(1, (n_data + n_fat + n_difat + 127) // 128)
-
-        fat_start = n_data
-        difat_start = fat_start + n_fat if n_difat > 0 else ENDOFCHAIN
-
-        fat_full = self.big_fat + [FREESECT] * (n_fat * 128 - len(self.big_fat))
-        for i in range(n_fat):
-            fat_full[fat_start + i] = FATSECT
-        for i in range(n_difat):
-            fat_full[difat_start + i] = DIFSECT
-
-        fat_sectors_data = [struct.pack('<128I', *fat_full[i*128:(i+1)*128]) for i in range(n_fat)]
-
-        fat_refs = list(range(fat_start, fat_start + n_fat))
-        header_refs = fat_refs[:109]
-        extra_refs  = fat_refs[109:]
-        difat_sectors_data = []
-        for ci in range(n_difat):
-            chunk = extra_refs[ci*127:(ci+1)*127]
-            chunk += [FREESECT] * (127 - len(chunk))
-            nxt = difat_start + ci + 1 if ci + 1 < n_difat else ENDOFCHAIN
-            chunk.append(nxt)
-            difat_sectors_data.append(struct.pack('<128I', *chunk))
-
-        # 5) 헤더
-        hdr = bytearray(512)
-        hdr[0:8] = b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1'
-        struct.pack_into('<H', hdr, 24, 0x3E)
-        struct.pack_into('<H', hdr, 26, 3)
-        struct.pack_into('<H', hdr, 28, 0xFFFE)
-        struct.pack_into('<H', hdr, 30, 9)   # sector size exp -> 512
-        struct.pack_into('<H', hdr, 32, 6)   # mini sector size exp -> 64
-        struct.pack_into('<I', hdr, 40, 0)
-        struct.pack_into('<I', hdr, 44, n_fat)
-        struct.pack_into('<I', hdr, 48, dir_start)
-        struct.pack_into('<I', hdr, 52, 0)
-        struct.pack_into('<I', hdr, 56, MINI_CUTOFF)
-        struct.pack_into('<I', hdr, 60, minifat_start)
-        struct.pack_into('<I', hdr, 64, n_minifat_sectors)
-        struct.pack_into('<I', hdr, 68, difat_start if n_difat > 0 else ENDOFCHAIN)
-        struct.pack_into('<I', hdr, 72, n_difat)
-        for i, ref in enumerate(header_refs[:109]):
-            struct.pack_into('<I', hdr, 76 + i*4, ref)
-        for i in range(len(header_refs), 109):
-            struct.pack_into('<I', hdr, 76 + i*4, FREESECT)
-
-        return (bytes(hdr)
-                + b''.join(self.big_sectors)
-                + b''.join(fat_sectors_data)
-                + b''.join(difat_sectors_data))
-
-
-def build_zip_msg(zip_path):
-    zip_name  = os.path.basename(zip_path)
-    zip_stem  = os.path.splitext(zip_name)[0]
-    zip_ext   = os.path.splitext(zip_name)[1]
+    zip_name = os.path.basename(zip_path)
+    zip_stem = os.path.splitext(zip_name)[0]
+    zip_ext  = os.path.splitext(zip_name)[1]
     mime_type = 'application/x-zip-compressed'
-
     with open(zip_path, 'rb') as f:
         zip_raw = f.read()
 
-    sender_name  = zip_stem
-    sender_email = f'{zip_stem}@attachment.msg'
-    conv_topic   = zip_stem
-    body_text    = f'Attachment: {zip_name}'
+    # 루트(0)와 첨부 storage 찾기
+    root_sid = 0
+    attach_sid = None
+    for sid in range(len(reader.dir_raw)):
+        if reader.entry_name(sid).startswith('__attach_version1.0_'):
+            attach_sid = sid
+            break
+    if attach_sid is None:
+        raise RuntimeError('템플릿에서 첨부 storage를 찾을 수 없습니다.')
 
-    b = MsgBuilder()
+    # 첨부 storage의 자식 스트림들을 이름으로 매핑
+    attach_children = reader.all_children(attach_sid)
+    attach_stream_by_name = {reader.entry_name(s): s for s in attach_children}
 
-    # ── 루트 스트림 데이터 ──
-    mc      = encode16('IPM.Note')
-    subj    = encode16(zip_name)
-    sname   = encode16(sender_name)
-    semail  = encode16(sender_email)
-    stype   = encode16('SMTP')
-    ctopic  = encode16(conv_topic)
-    body_b  = encode16(body_text)
-    dispto  = encode16('')
+    # 루트의 모든 자식(첨부 storage 포함) 전부 그대로 유지
+    root_children = reader.all_children(root_sid)
 
-    root_prop = build_root_props([
-        prop_fixed(0x0040, 0x0039, filetime_now()),
-        prop_var(0x001F, 0x001A, len(mc)),
-        prop_var(0x001F, 0x0037, len(subj)),
-        prop_var(0x001F, 0x0070, len(ctopic)),
-        prop_var(0x001F, 0x0C1A, len(sname)),
-        prop_var(0x001F, 0x0C1F, len(semail)),
-        prop_var(0x001F, 0x0C1E, len(stype)),
-        prop_var(0x001F, 0x0042, len(sname)),
-        prop_var(0x001F, 0x0065, len(semail)),
-        prop_var(0x001F, 0x0064, len(stype)),
-        prop_var(0x001F, 0x0E04, len(dispto)),
-        prop_var(0x001F, 0x1000, len(body_b)),
-        prop_fixed(0x000B, 0x0E1B, struct.pack('<I', 1)),
-    ])
+    # ── 새로 교체할 첨부 관련 스트림 값들 ──
+    replacements = {
+        '__substg1.0_3001001F': encode16(zip_name),     # display name
+        '__substg1.0_3703001F': encode16(zip_ext),      # short filename
+        '__substg1.0_3704001F': encode16(zip_ext),      # extension
+        '__substg1.0_3707001F': encode16(zip_name),     # long filename
+        '__substg1.0_370E001F': encode16(mime_type),    # mime type
+        '__substg1.0_37010102': zip_raw,                # 실제 바이너리 데이터
+    }
 
-    b.add_stream('root_prop', root_prop)
-    b.add_stream('mc', mc)
-    b.add_stream('subj', subj)
-    b.add_stream('sname', sname)
-    b.add_stream('semail', semail)
-    b.add_stream('stype', stype)
-    b.add_stream('ctopic', ctopic)
-    b.add_stream('body', body_b)
-    b.add_stream('dispto', dispto)
+    # ── 모든 스트림 데이터 수집 (SID -> bytes), 교체 대상은 새 값으로 ──
+    stream_data = {}   # sid -> bytes (스트림인 경우만)
+    storage_sids = set()  # storage(폴더) SID
 
-    # ── 첨부 스트림 데이터 ──
-    ext       = encode16(zip_ext)
-    lname     = encode16(zip_name)       # 긴 파일명 (3707, 3001)
-    shortname = encode16(zip_ext)        # 단축 파일명은 확장자만 (3703) — 실제 Outlook 동작과 동일
-    mime      = encode16(mime_type)
-    locale    = encode16('EnUs')
+    def collect(sid):
+        f = reader.entry_fields(sid)
+        if f['etype'] == 1 or f['etype'] == 5:  # storage or root
+            storage_sids.add(sid)
+            for child in reader.all_children(sid):
+                collect(child)
+        elif f['etype'] == 2:  # stream
+            name = reader.entry_name(sid)
+            if sid in attach_stream_by_name.values() and name in replacements:
+                stream_data[sid] = replacements[name]
+            else:
+                stream_data[sid] = reader.read_stream(sid)
 
-    att_prop = build_att_props([
-        prop_fixed(0x0003, 0x0E21, struct.pack('<I', 0)),
-        prop_fixed(0x0003, 0x3705, struct.pack('<I', 1)),
-        prop_var(0x001F, 0x3001, len(lname)),
-        prop_var(0x001F, 0x3703, len(shortname)),
-        prop_var(0x001F, 0x3704, len(ext)),
-        prop_fixed(0x0003, 0x370B, struct.pack('<i', -1)),  # PR_RENDERING_POSITION = -1 (렌더링 안 함)
-        prop_var(0x001F, 0x3707, len(lname)),
-        prop_var(0x001F, 0x370E, len(mime)),
-        prop_var(0x001F, 0x3A0C, len(locale)),
-        prop_var(0x0102, 0x3701, len(zip_raw)),
-    ])
+    collect(root_sid)
 
-    b.add_stream('att_prop', att_prop)
-    b.add_stream('ext', ext)
-    b.add_stream('lname', lname)
-    b.add_stream('shortname', shortname)
-    b.add_stream('mime', mime)
-    b.add_stream('locale', locale)
-    b.add_stream('zipdata', zip_raw)   # 큰 데이터는 자동으로 일반 섹터 사용
+    # __properties_version1.0 (첨부) 안의 size 필드도 갱신 필요
+    # → 해당 스트림은 stream_data에서 직접 재작성
+    if '__properties_version1.0' in attach_stream_by_name:
+        props_sid = attach_stream_by_name['__properties_version1.0']
+        old_props = stream_data[props_sid]
+        new_props = bytearray(old_props)
+        # 16바이트 엔트리들을 순회하며 가변 길이 항목의 size 갱신
+        tag_to_newsize = {
+            0x3001: len(replacements['__substg1.0_3001001F']),
+            0x3703: len(replacements['__substg1.0_3703001F']),
+            0x3704: len(replacements['__substg1.0_3704001F']),
+            0x3707: len(replacements['__substg1.0_3707001F']),
+            0x370E: len(replacements['__substg1.0_370E001F']),
+            0x3701: len(replacements['__substg1.0_37010102']),
+        }
+        for off in range(8, len(new_props), 16):
+            chunk = bytes(new_props[off:off + 16])
+            if len(chunk) < 16:
+                break
+            ptype = struct.unpack_from('<H', chunk, 0)[0]
+            tag   = struct.unpack_from('<H', chunk, 2)[0]
+            if tag in tag_to_newsize and ptype in (0x001F, 0x0102):
+                new_size = tag_to_newsize[tag]
+                struct.pack_into('<I', new_props, off + 8, new_size)
+        stream_data[props_sid] = bytes(new_props)
 
-    def build_dirs(info, root_start, root_size):
-        # ── 첨부 스토리지의 자식들 (정렬 후 사슬 구성) ──
-        att_children = [
-            ('__properties_version1.0', 2, *info('att_prop'), None),
-            ('__substg1.0_3704001F',     2, *info('ext'),       None),
-            ('__substg1.0_3703001F',     2, *info('shortname'), None),
-            ('__substg1.0_3707001F',     2, *info('lname'),     None),
-            ('__substg1.0_3001001F',     2, *info('lname'),     None),
-            ('__substg1.0_370E001F',     2, *info('mime'),      None),
-            ('__substg1.0_3A0C001F',     2, *info('locale'),    None),
-            ('__substg1.0_37010102',     2, *info('zipdata'),   None),
-        ]
-        # SID 배치: 0=Root, 1..9=루트 자식(9개), 10=첨부 스토리지, 11..18=첨부 자식(8개)
-        att_entries, att_first = build_storage_chain(att_children, sid_offset=11)
+    # ── 섹터 할당: 4096바이트 미만 스트림은 미니스트림(64바이트 단위), 이상은 일반 섹터 ──
+    MINI_CUTOFF = 4096
+    MINI_SECTOR = 64
 
-        # ── 루트의 자식들 (첨부 스토리지 포함) ──
-        root_children = [
-            ('__properties_version1.0',      2, *info('root_prop'), None),
-            ('__substg1.0_001A001F',          2, *info('mc'),       None),
-            ('__substg1.0_0037001F',          2, *info('subj'),     None),
-            ('__substg1.0_0C1A001F',          2, *info('sname'),    None),
-            ('__substg1.0_0C1F001F',          2, *info('semail'),   None),
-            ('__substg1.0_0C1E001F',          2, *info('stype'),    None),
-            ('__substg1.0_0070001F',          2, *info('ctopic'),   None),
-            ('__substg1.0_1000001F',          2, *info('body'),     None),
-            ('__substg1.0_0E04001F',          2, *info('dispto'),   None),
-            ('__attach_version1.0_#00000000', 1, NOSTREAM, 0,        att_first),
-        ]
-        root_entries, root_first = build_storage_chain(root_children, sid_offset=1)
+    def pad64(data):
+        r = len(data) % MINI_SECTOR
+        return data + b'\x00' * (MINI_SECTOR - r) if r else data
 
-        dirs = [de('Root Entry', 5, root_start, root_size, child=root_first, color=0)]
-        dirs.extend(root_entries)
-        dirs.extend(att_entries)
-        return dirs
+    mini_sectors = []
+    mini_fat = []
+    sectors = []
+    fat = []
 
-    return b.finalize(build_dirs)
+    def alloc_big(data):
+        if not data:
+            return NOSTREAM, 0
+        data_padded = pad512(data)
+        nsec = len(data_padded) // 512
+        start = len(sectors)
+        for i in range(nsec):
+            sectors.append(data_padded[i * 512:(i + 1) * 512])
+            fat.append(start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
+        return start, len(data)
+
+    def alloc_mini(data):
+        if not data:
+            return NOSTREAM, 0
+        data_padded = pad64(data)
+        nsec = len(data_padded) // MINI_SECTOR
+        start = len(mini_sectors)
+        for i in range(nsec):
+            mini_sectors.append(data_padded[i*MINI_SECTOR:(i+1)*MINI_SECTOR])
+            mini_fat.append(start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
+        return start, len(data)
+
+    def alloc(data):
+        if len(data) < MINI_CUTOFF:
+            return alloc_mini(data)
+        return alloc_big(data)
+
+    sid_to_loc = {}      # sid -> (start, size)
+    sid_is_mini = {}     # sid -> bool
+    for sid, data in stream_data.items():
+        if len(data) < MINI_CUTOFF:
+            sid_to_loc[sid] = alloc_mini(data)
+            sid_is_mini[sid] = True
+        else:
+            sid_to_loc[sid] = alloc_big(data)
+            sid_is_mini[sid] = False
+
+    # ── 미니스트림을 일반 섹터에 패킹 ──
+    mini_stream_blob = pad512(b''.join(mini_sectors))
+    root_ministream_start = NOSTREAM
+    root_ministream_size = 0
+    if mini_stream_blob:
+        nsec = len(mini_stream_blob) // 512
+        root_ministream_start = len(sectors)
+        for i in range(nsec):
+            sectors.append(mini_stream_blob[i*512:(i+1)*512])
+            fat.append(root_ministream_start + i + 1 if i < nsec - 1 else ENDOFCHAIN)
+        root_ministream_size = len(b''.join(mini_sectors))
+
+    # ── 미니FAT 섹터 (일반 섹터에 저장) ──
+    minifat_start_sec = ENDOFCHAIN
+    n_minifat_sectors = 0
+    if mini_fat:
+        rem = len(mini_fat) % 128
+        mf = mini_fat + ([FREESECT] * (128 - rem) if rem else [])
+        n_minifat_sectors = len(mf) // 128
+        minifat_start_sec = len(sectors)
+        for i in range(n_minifat_sectors):
+            chunk = mf[i*128:(i+1)*128]
+            sectors.append(struct.pack('<128I', *chunk))
+            fat.append(minifat_start_sec + i + 1 if i < n_minifat_sectors - 1 else ENDOFCHAIN)
+
+    # ── 디렉토리 재작성 (구조/이름/색상/타임스탬프는 원본 유지, start/size만 갱신) ──
+    n_entries = len(reader.dir_raw)
+    new_dir_entries = [None] * n_entries
+
+    for sid in range(n_entries):
+        orig = bytearray(reader.dir_raw[sid])
+        f = reader.entry_fields(sid)
+        if sid in storage_sids:
+            if sid == root_sid:
+                # Root Entry: 미니스트림 컨테이너 시작 섹터/크기 기록
+                struct.pack_into('<I', orig, 116, root_ministream_start if root_ministream_start != NOSTREAM else ENDOFCHAIN)
+                struct.pack_into('<I', orig, 120, root_ministream_size)
+            # 일반 storage는 원본 그대로 유지(start=0)
+            new_dir_entries[sid] = bytes(orig)
+        else:
+            # stream: 새로 할당된 위치로 갱신 (미니 스트림이면 미니섹터 인덱스, 아니면 일반 섹터 인덱스)
+            start, size = sid_to_loc.get(sid, (NOSTREAM, 0))
+            real_start = start if start != NOSTREAM else ENDOFCHAIN
+            struct.pack_into('<I', orig, 116, real_start)
+            struct.pack_into('<I', orig, 120, size)
+            new_dir_entries[sid] = bytes(orig)
+
+    dir_data = pad512(b''.join(new_dir_entries))
+    dir_start, _ = alloc_big(dir_data)
+
+    # ── FAT/DIFAT 섹터 계산 ──
+    n_data = len(sectors)
+    n_fat = max(1, (n_data + 127) // 128)
+    n_difat = 0
+    for _ in range(5):
+        n_difat = max(0, (n_fat - 109 + 126) // 127) if n_fat > 109 else 0
+        n_fat = max(1, (n_data + n_fat + n_difat + 127) // 128)
+
+    fat_start = n_data
+    difat_start_sec = fat_start + n_fat if n_difat > 0 else ENDOFCHAIN
+
+    fat_full = fat + [FREESECT] * (n_fat * 128 - len(fat))
+    for i in range(n_fat):
+        fat_full[fat_start + i] = FATSECT
+    for i in range(n_difat):
+        fat_full[difat_start_sec + i] = DIFSECT
+
+    fat_sectors_data = [struct.pack('<128I', *fat_full[i*128:(i+1)*128]) for i in range(n_fat)]
+
+    fat_refs = list(range(fat_start, fat_start + n_fat))
+    header_refs = fat_refs[:109]
+    extra_refs  = fat_refs[109:]
+    difat_sectors_data = []
+    for ci in range(n_difat):
+        chunk = extra_refs[ci*127:(ci+1)*127]
+        chunk += [FREESECT] * (127 - len(chunk))
+        nxt = difat_start_sec + ci + 1 if ci + 1 < n_difat else ENDOFCHAIN
+        chunk.append(nxt)
+        difat_sectors_data.append(struct.pack('<128I', *chunk))
+
+    # ── 헤더 (미니FAT 사용 안 함 - 전부 일반 섹터로 단순화) ──
+    hdr = bytearray(512)
+    hdr[0:8] = b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1'
+    struct.pack_into('<H', hdr, 24, 0x3E)
+    struct.pack_into('<H', hdr, 26, 3)
+    struct.pack_into('<H', hdr, 28, 0xFFFE)
+    struct.pack_into('<H', hdr, 30, 9)
+    struct.pack_into('<H', hdr, 32, 6)
+    struct.pack_into('<I', hdr, 40, 0)
+    struct.pack_into('<I', hdr, 44, n_fat)
+    struct.pack_into('<I', hdr, 48, dir_start)
+    struct.pack_into('<I', hdr, 52, 0)
+    struct.pack_into('<I', hdr, 56, 0x1000)
+    struct.pack_into('<I', hdr, 60, minifat_start_sec)
+    struct.pack_into('<I', hdr, 64, n_minifat_sectors)
+    struct.pack_into('<I', hdr, 68, difat_start_sec if n_difat > 0 else ENDOFCHAIN)
+    struct.pack_into('<I', hdr, 72, n_difat)
+    for i, ref in enumerate(header_refs[:109]):
+        struct.pack_into('<I', hdr, 76 + i * 4, ref)
+    for i in range(len(header_refs), 109):
+        struct.pack_into('<I', hdr, 76 + i * 4, FREESECT)
+
+    return (bytes(hdr)
+            + b''.join(sectors)
+            + b''.join(fat_sectors_data)
+            + b''.join(difat_sectors_data))
 
 
 def main():
-    base_dir  = get_exe_dir()
+    base_dir = get_exe_dir()
     zip_files = glob.glob(os.path.join(base_dir, '*.zip'))
+    template_path = os.path.join(base_dir, 'template.msg')
 
     print('=' * 52)
-    print('  ZIP → MSG Converter')
+    print('  ZIP → MSG Converter (템플릿 기반)')
     print('=' * 52)
+
+    if not os.path.exists(template_path):
+        print(f'\n[오류] template.msg 파일이 없습니다.')
+        print(f'  필요 경로: {template_path}')
+        input('\nEnter 키를 눌러 종료...')
+        sys.exit(1)
 
     if not zip_files:
         print(f'\n[오류] 같은 폴더에 .zip 파일이 없습니다.')
-        print(f'  폴더: {base_dir}')
         input('\nEnter 키를 눌러 종료...')
         sys.exit(1)
 
@@ -432,17 +482,19 @@ def main():
 
     ok = fail = 0
     for zip_path in zip_files:
-        base     = os.path.splitext(zip_path)[0]
+        base = os.path.splitext(zip_path)[0]
         msg_path = base + '.msg'
-        fname    = os.path.basename(zip_path)
+        fname = os.path.basename(zip_path)
         try:
-            out = build_zip_msg(zip_path)
+            out = build_msg_from_template(template_path, zip_path)
             with open(msg_path, 'wb') as f:
                 f.write(out)
             print(f'  ✓  {fname}  →  {os.path.basename(msg_path)}')
             ok += 1
         except Exception as e:
             print(f'  ✗  {fname}  ({e})')
+            import traceback
+            traceback.print_exc()
             fail += 1
 
     print(f'\n  완료: 성공 {ok}개 / 실패 {fail}개')
