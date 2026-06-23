@@ -55,18 +55,35 @@ def de(name, etype, start, size,
     b    = struct.pack('<H', nlen) + struct.pack('<B', etype) + struct.pack('<B', color)
     b   += struct.pack('<III', left, right, child)
     b   += b'\x00' * 16 + struct.pack('<IQQ', 0, 0, 0)
-    b   += struct.pack('<II', start if start != NOSTREAM else ENDOFCHAIN, size)
+    # storage(폴더, etype=1)는 start sector가 의미 없으므로 0으로 고정.
+    # stream(etype=2)에서 start=NOSTREAM이면(빈 스트림) ENDOFCHAIN으로 표기.
+    if etype == 1:
+        real_start = 0
+    elif etype == 5:
+        # Root Entry: 미니 스트림 컨테이너 시작 섹터(없으면 ENDOFCHAIN)
+        real_start = start if start != NOSTREAM else ENDOFCHAIN
+    else:
+        real_start = start if start != NOSTREAM else ENDOFCHAIN
+    b   += struct.pack('<II', real_start, size)
     b   += b'\x00' * 4
     assert len(ne) + len(b) == 128
     return ne + b
 
 
 def empty_de():
-    """패딩용 빈 디렉토리 엔트리"""
-    return b'\x00' * 64 + struct.pack('<HBBI', 0, 0, 1, NOSTREAM) + \
-           struct.pack('<III', NOSTREAM, NOSTREAM, NOSTREAM) + \
-           b'\x00' * 16 + struct.pack('<IQQ', 0, 0, 0) + \
-           struct.pack('<II', ENDOFCHAIN, 0) + b'\x00' * 4
+    """패딩용 빈 디렉토리 엔트리 (STGTY_INVALID=0, sibling/child=NOSTREAM, start/size=0)"""
+    name = b'\x00' * 64
+    body = struct.pack('<H', 0)        # name length = 0
+    body += struct.pack('<B', 0)       # object type = 0 (unknown/unused)
+    body += struct.pack('<B', 0)       # color flag = red(0)
+    body += struct.pack('<III', NOSTREAM, NOSTREAM, NOSTREAM)  # left, right, child
+    body += b'\x00' * 16               # CLSID
+    body += struct.pack('<I', 0)       # state bits
+    body += struct.pack('<QQ', 0, 0)   # created, modified
+    body += struct.pack('<II', 0, 0)   # start sector, size
+    body += b'\x00' * 4                # reserved (size high, for v4)
+    assert len(name) + len(body) == 128
+    return name + body
 
 
 def ole_sort_key(name):
