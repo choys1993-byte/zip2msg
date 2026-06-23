@@ -24,8 +24,13 @@ jobs:
       - name: Build EXE
         run: pyinstaller --onefile --console --name "ZIP_to_MSG" zip_to_msg.py
 
-      - name: Upload EXE artifact
+      - name: Copy template next to EXE
+        run: copy template.msg dist\template.msg
+
+      - name: Upload package (EXE + template)
         uses: actions/upload-artifact@v4
         with:
-          name: ZIP_to_MSG
-          path: dist/ZIP_to_MSG.exe
+          name: ZIP_to_MSG_package
+          path: |
+            dist/ZIP_to_MSG.exe
+            dist/template.msg
