@@ -72,9 +72,10 @@ def empty_de():
 def build_root_props(entries, next_recipient_id=0, next_attachment_id=1,
                       recipient_count=0, attachment_count=1):
     """
-    루트 properties 헤더 32바이트 (MS-OXMSG 스펙):
+    루트 properties 헤더 32바이트 (MS-OXMSG):
       reserved(8) + nextRecipientId(4) + nextAttachmentId(4)
       + recipientCount(4) + attachmentCount(4) + reserved(8)
+    엔트리는 16바이트: ptype(2)+tag(2)+flag(4)+value(8)
     """
     hdr = b'\x00' * 8
     hdr += struct.pack('<I', next_recipient_id)
@@ -82,14 +83,25 @@ def build_root_props(entries, next_recipient_id=0, next_attachment_id=1,
     hdr += struct.pack('<I', recipient_count)
     hdr += struct.pack('<I', attachment_count)
     hdr += b'\x00' * 8
-    body = b''.join(struct.pack('<HH', pt, tag) + val[:4] for pt, tag, val in entries)
+    body = b''.join(entries)
     return hdr + body
 
 
 def build_att_props(entries):
-    """첨부 properties: 헤더 8바이트(reserved) + (ptype,tag,4바이트값) 반복"""
-    body = b''.join(struct.pack('<HH', pt, tag) + val[:4] for pt, tag, val in entries)
+    """첨부 properties: 헤더 8바이트(reserved) + 16바이트 엔트리 반복"""
+    body = b''.join(entries)
     return b'\x00' * 8 + body
+
+
+def prop_fixed(ptype, tag, value8):
+    """고정 크기 프로퍼티 16바이트: ptype+tag+flag(2)+value(8, 부족하면 0패딩)"""
+    value8 = value8[:8].ljust(8, b'\x00')
+    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 2) + value8
+
+
+def prop_var(ptype, tag, size):
+    """가변 크기 프로퍼티 16바이트: ptype+tag+flag(6)+size(4)+reserved(4)"""
+    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 6) + struct.pack('<I', size) + struct.pack('<I', 3)
 
 
 class MsgBuilder:
@@ -267,19 +279,19 @@ def build_zip_msg(zip_path):
     dispto  = encode16('')
 
     root_prop = build_root_props([
-        (0x0040, 0x0039, filetime_now()),
-        (0x001F, 0x001A, struct.pack('<I', len(mc))),
-        (0x001F, 0x0037, struct.pack('<I', len(subj))),
-        (0x001F, 0x0070, struct.pack('<I', len(ctopic))),
-        (0x001F, 0x0C1A, struct.pack('<I', len(sname))),
-        (0x001F, 0x0C1F, struct.pack('<I', len(semail))),
-        (0x001F, 0x0C1E, struct.pack('<I', len(stype))),
-        (0x001F, 0x0042, struct.pack('<I', len(sname))),
-        (0x001F, 0x0065, struct.pack('<I', len(semail))),
-        (0x001F, 0x0064, struct.pack('<I', len(stype))),
-        (0x001F, 0x0E04, struct.pack('<I', len(dispto))),
-        (0x001F, 0x1000, struct.pack('<I', len(body_b))),
-        (0x000B, 0x0E1B, struct.pack('<I', 1)),
+        prop_fixed(0x0040, 0x0039, filetime_now()),
+        prop_var(0x001F, 0x001A, len(mc)),
+        prop_var(0x001F, 0x0037, len(subj)),
+        prop_var(0x001F, 0x0070, len(ctopic)),
+        prop_var(0x001F, 0x0C1A, len(sname)),
+        prop_var(0x001F, 0x0C1F, len(semail)),
+        prop_var(0x001F, 0x0C1E, len(stype)),
+        prop_var(0x001F, 0x0042, len(sname)),
+        prop_var(0x001F, 0x0065, len(semail)),
+        prop_var(0x001F, 0x0064, len(stype)),
+        prop_var(0x001F, 0x0E04, len(dispto)),
+        prop_var(0x001F, 0x1000, len(body_b)),
+        prop_fixed(0x000B, 0x0E1B, struct.pack('<I', 1)),
     ])
 
     b.add_stream('root_prop', root_prop)
@@ -299,15 +311,15 @@ def build_zip_msg(zip_path):
     locale = encode16('EnUs')
 
     att_prop = build_att_props([
-        (0x0003, 0x0E21, struct.pack('<I', 0)),
-        (0x0003, 0x3705, struct.pack('<I', 1)),
-        (0x001F, 0x3001, struct.pack('<I', len(lname))),
-        (0x001F, 0x3703, struct.pack('<I', len(lname))),
-        (0x001F, 0x3704, struct.pack('<I', len(ext))),
-        (0x001F, 0x3707, struct.pack('<I', len(lname))),
-        (0x001F, 0x370E, struct.pack('<I', len(mime))),
-        (0x001F, 0x3A0C, struct.pack('<I', len(locale))),
-        (0x0102, 0x3701, struct.pack('<I', len(zip_raw))),
+        prop_fixed(0x0003, 0x0E21, struct.pack('<I', 0)),
+        prop_fixed(0x0003, 0x3705, struct.pack('<I', 1)),
+        prop_var(0x001F, 0x3001, len(lname)),
+        prop_var(0x001F, 0x3703, len(lname)),
+        prop_var(0x001F, 0x3704, len(ext)),
+        prop_var(0x001F, 0x3707, len(lname)),
+        prop_var(0x001F, 0x370E, len(mime)),
+        prop_var(0x001F, 0x3A0C, len(locale)),
+        prop_var(0x0102, 0x3701, len(zip_raw)),
     ])
 
     b.add_stream('att_prop', att_prop)
