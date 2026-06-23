@@ -120,13 +120,14 @@ def build_att_props(entries):
 
 
 def prop_fixed(ptype, tag, value8):
-    """고정 크기 프로퍼티 16바이트: ptype+tag+flag(2)+value(8, 부족하면 0패딩)"""
+    """고정 크기 프로퍼티 16바이트: ptype+tag+flag(4)+value(8, 부족하면 0패딩)
+    실제 Outlook 파일 분석 결과 flag는 고정/가변 무관하게 항상 0x00000006."""
     value8 = value8[:8].ljust(8, b'\x00')
-    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 2) + value8
+    return struct.pack('<HH', ptype, tag) + struct.pack('<I', 6) + value8
 
 
 def prop_var(ptype, tag, size):
-    """가변 크기 프로퍼티 16바이트: ptype+tag+flag(6)+size(4)+reserved(4)"""
+    """가변 크기 프로퍼티 16바이트: ptype+tag+flag(6)+size(4)+reserved(3)"""
     return struct.pack('<HH', ptype, tag) + struct.pack('<I', 6) + struct.pack('<I', size) + struct.pack('<I', 3)
 
 
@@ -343,6 +344,7 @@ def build_zip_msg(zip_path):
         prop_var(0x001F, 0x3001, len(lname)),
         prop_var(0x001F, 0x3703, len(shortname)),
         prop_var(0x001F, 0x3704, len(ext)),
+        prop_fixed(0x0003, 0x370B, struct.pack('<i', -1)),  # PR_RENDERING_POSITION = -1 (렌더링 안 함)
         prop_var(0x001F, 0x3707, len(lname)),
         prop_var(0x001F, 0x370E, len(mime)),
         prop_var(0x001F, 0x3A0C, len(locale)),
