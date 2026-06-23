@@ -69,14 +69,25 @@ def empty_de():
            struct.pack('<II', ENDOFCHAIN, 0) + b'\x00' * 4
 
 
-def build_root_props(entries):
-    """루트 properties: 헤더 32바이트 + (ptype,tag,4바이트값) 반복"""
+def build_root_props(entries, next_recipient_id=0, next_attachment_id=1,
+                      recipient_count=0, attachment_count=1):
+    """
+    루트 properties 헤더 32바이트 (MS-OXMSG 스펙):
+      reserved(8) + nextRecipientId(4) + nextAttachmentId(4)
+      + recipientCount(4) + attachmentCount(4) + reserved(8)
+    """
+    hdr = b'\x00' * 8
+    hdr += struct.pack('<I', next_recipient_id)
+    hdr += struct.pack('<I', next_attachment_id)
+    hdr += struct.pack('<I', recipient_count)
+    hdr += struct.pack('<I', attachment_count)
+    hdr += b'\x00' * 8
     body = b''.join(struct.pack('<HH', pt, tag) + val[:4] for pt, tag, val in entries)
-    return b'\x00' * 32 + body
+    return hdr + body
 
 
 def build_att_props(entries):
-    """첨부 properties: 헤더 8바이트 + (ptype,tag,4바이트값) 반복"""
+    """첨부 properties: 헤더 8바이트(reserved) + (ptype,tag,4바이트값) 반복"""
     body = b''.join(struct.pack('<HH', pt, tag) + val[:4] for pt, tag, val in entries)
     return b'\x00' * 8 + body
 
