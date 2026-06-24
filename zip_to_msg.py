@@ -209,15 +209,23 @@ def filetime_now():
     return struct.pack('<Q', int((dt - epoch).total_seconds() * 10_000_000))
 
 
-def build_msg_from_template(template_path, zip_path):
+def filetime_from_now():
+    """현재 시각을 Windows FILETIME(8바이트)으로 변환"""
+    return filetime_now()
+
+
+def build_msg_from_template(template_path, zip_path, sender_email=None, sender_name=None):
     """
     template_path: 실제 Outlook이 만든 .msg (구조/메타데이터 원본)
     zip_path: 새로 첨부할 zip 파일
+    sender_email: 보낸사람 이메일 주소를 바꾸고 싶을 때 지정 (None이면 템플릿 값 유지)
+    sender_name: 보낸사람 표시 이름 (None이면 zip 파일명 기준 자동 생성)
 
     동작:
       1. 템플릿의 모든 스트림(루트+첨부 storage)을 읽어들임
       2. 첨부 storage의 파일명/확장자/MIME/데이터를 새 zip 정보로 교체
-      3. 동일한 구조(디렉토리 색상/순서/메타데이터)로 새 OLE2 파일을 재조립
+      3. 보낸사람 이메일/이름, 보낸시간/받은시간을 새 값으로 교체
+      4. 동일한 구조(디렉토리 색상/순서/메타데이터)로 새 OLE2 파일을 재조립
     """
     reader = OleReader(template_path)
 
@@ -242,8 +250,11 @@ def build_msg_from_template(template_path, zip_path):
     attach_children = reader.all_children(attach_sid)
     attach_stream_by_name = {reader.entry_name(s): s for s in attach_children}
 
-    # 루트의 모든 자식(첨부 storage 포함) 전부 그대로 유지
+    # 루트 자식 스트림들 이름 매핑 (보낸사람/시간 교체용)
     root_children = reader.all_children(root_sid)
+    root_stream_by_name = {reader.entry_name(s): s for s in root_children}
+
+    now_filetime = filetime_from_now()
 
     # ── 새로 교체할 첨부 관련 스트림 값들 ──
     replacements = {
@@ -253,6 +264,22 @@ def build_msg_from_template(template_path, zip_path):
         '__substg1.0_3707001F': encode16(zip_name),     # long filename
         '__substg1.0_370E001F': encode16(mime_type),    # mime type
         '__substg1.0_37010102': zip_raw,                # 실제 바이너리 데이터
+    }
+
+    # ── 루트 레벨(메일 헤더) 교체 값들 ──
+    root_replacements = {}
+    if sender_email:
+        disp_name = sender_name if sender_name else sender_email.split('@')[0]
+        root_replacements.update({
+            '__substg1.0_0C1F001F': encode16(sender_email),  # PR_SENDER_EMAIL_ADDRESS
+            '__substg1.0_0065001F': encode16(sender_email),  # PR_SENT_REPRESENTING_EMAIL_ADDRESS
+            '__substg1.0_0C1A001F': encode16(disp_name),     # PR_SENDER_NAME
+            '__substg1.0_0042001F': encode16(disp_name),     # PR_SENT_REPRESENTING_NAME
+        })
+    # 보낸시간/받은시간은 항상 현재 시각으로 갱신 (고정 크기 8바이트라 별도 처리)
+    fixed_time_replacements = {
+        '__substg1.0_00390040': now_filetime,  # PR_CLIENT_SUBMIT_TIME (보낸 시간)
+        '__substg1.0_0E060040': now_filetime,  # PR_MESSAGE_DELIVERY_TIME (받은 시간)
     }
 
     # ── 모든 스트림 데이터 수집 (SID -> bytes), 교체 대상은 새 값으로 ──
@@ -269,6 +296,8 @@ def build_msg_from_template(template_path, zip_path):
             name = reader.entry_name(sid)
             if sid in attach_stream_by_name.values() and name in replacements:
                 stream_data[sid] = replacements[name]
+            elif sid in root_stream_by_name.values() and name in root_replacements:
+                stream_data[sid] = root_replacements[name]
             else:
                 stream_data[sid] = reader.read_stream(sid)
 
@@ -299,6 +328,38 @@ def build_msg_from_template(template_path, zip_path):
                 new_size = tag_to_newsize[tag]
                 struct.pack_into('<I', new_props, off + 8, new_size)
         stream_data[props_sid] = bytes(new_props)
+
+    # ── 루트 __properties_version1.0: 가변 size 갱신 + 고정 시간값(0039,0E06) 직접 덮어쓰기 ──
+    if '__properties_version1.0' in root_stream_by_name:
+        rprops_sid = root_stream_by_name['__properties_version1.0']
+        old_rprops = stream_data[rprops_sid]
+        new_rprops = bytearray(old_rprops)
+
+        root_tag_to_newsize = {}
+        if sender_email:
+            root_tag_to_newsize = {
+                0x0C1F: len(root_replacements['__substg1.0_0C1F001F']),
+                0x0065: len(root_replacements['__substg1.0_0065001F']),
+                0x0C1A: len(root_replacements['__substg1.0_0C1A001F']),
+                0x0042: len(root_replacements['__substg1.0_0042001F']),
+            }
+
+        for off in range(32, len(new_rprops), 16):
+            chunk = bytes(new_rprops[off:off + 16])
+            if len(chunk) < 16:
+                break
+            ptype = struct.unpack_from('<H', chunk, 0)[0]
+            tag   = struct.unpack_from('<H', chunk, 2)[0]
+            if tag in root_tag_to_newsize and ptype == 0x001F:
+                struct.pack_into('<I', new_rprops, off + 8, root_tag_to_newsize[tag])
+            elif tag == 0x0039 and ptype == 0x0040:
+                # PR_CLIENT_SUBMIT_TIME: 고정 8바이트 값을 현재 시각으로 직접 교체
+                new_rprops[off + 8:off + 16] = now_filetime
+            elif tag == 0x0E06 and ptype == 0x0040:
+                # PR_MESSAGE_DELIVERY_TIME: 고정 8바이트 값을 현재 시각으로 직접 교체
+                new_rprops[off + 8:off + 16] = now_filetime
+
+        stream_data[rprops_sid] = bytes(new_rprops)
 
     # ── 섹터 할당: 4096바이트 미만 스트림은 미니스트림(64바이트 단위), 이상은 일반 섹터 ──
     MINI_CUTOFF = 4096
@@ -458,6 +519,19 @@ def build_msg_from_template(template_path, zip_path):
             + b''.join(difat_sectors_data))
 
 
+# ─────────────────────────────────────────────
+# 고정 발신자 설정 (필요 시 이 값만 수정)
+# ─────────────────────────────────────────────
+FIXED_SENDER_EMAIL = 'LOWUS@gmail.com'
+FIXED_SENDER_NAME  = 'LOWUS'
+# ─────────────────────────────────────────────
+
+
+def read_sender_config(base_dir):
+    """발신자는 고정값을 사용한다."""
+    return FIXED_SENDER_EMAIL, FIXED_SENDER_NAME
+
+
 def main():
     base_dir = get_exe_dir()
     zip_files = glob.glob(os.path.join(base_dir, '*.zip'))
@@ -478,7 +552,11 @@ def main():
         input('\nEnter 키를 눌러 종료...')
         sys.exit(1)
 
-    print(f'\n  {len(zip_files)}개 파일 발견\n')
+    sender_email, sender_name = read_sender_config(base_dir)
+    print(f'\n  발신자: {sender_name} <{sender_email}> (고정값)')
+    print('  보낸/받은 시간: 현재 시각으로 자동 설정\n')
+
+    print(f'  {len(zip_files)}개 파일 발견\n')
 
     ok = fail = 0
     for zip_path in zip_files:
@@ -486,7 +564,10 @@ def main():
         msg_path = base + '.msg'
         fname = os.path.basename(zip_path)
         try:
-            out = build_msg_from_template(template_path, zip_path)
+            out = build_msg_from_template(
+                template_path, zip_path,
+                sender_email=sender_email, sender_name=sender_name,
+            )
             with open(msg_path, 'wb') as f:
                 f.write(out)
             print(f'  ✓  {fname}  →  {os.path.basename(msg_path)}')
