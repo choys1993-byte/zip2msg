@@ -522,7 +522,7 @@ def build_msg_from_template(template_path, zip_path, sender_email=None, sender_n
 # ─────────────────────────────────────────────
 # 고정 발신자 설정 (필요 시 이 값만 수정)
 # ─────────────────────────────────────────────
-FIXED_SENDER_EMAIL = 'LOWUS@gmail.com'
+FIXED_SENDER_EMAIL = 'LOWUS@kalasd.com'
 FIXED_SENDER_NAME  = 'LOWUS'
 # ─────────────────────────────────────────────
 
